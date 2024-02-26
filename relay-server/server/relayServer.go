@@ -6,14 +6,10 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -22,9 +18,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	"github.com/kubearmor/kubearmor-relay-server/relay-server/cert"
 	kl "github.com/kubearmor/kubearmor-relay-server/relay-server/common"
 	cfg "github.com/kubearmor/kubearmor-relay-server/relay-server/config"
 	kg "github.com/kubearmor/kubearmor-relay-server/relay-server/log"
@@ -303,28 +301,18 @@ type LogClient struct {
 }
 
 func loadTLSCredentials() (credentials.TransportCredentials, error) {
-	// Load certificate of the CA who signed server's certificate
-	certPath := filepath.Join(cfg.GlobalConfig.TLSCertPath, "ca.crt")
-	if _, err := os.Stat(filepath.Clean(certPath)); err != nil {
-		kg.Warnf("Failed to read (%s) Error: %s", certPath, err.Error())
-		return nil, err
+	// create certificate configuration
+	clientCertConfig := cert.DefaultKubeArmorClientConfig
+	clientCertConfig.NotAfter = time.Now().AddDate(1, 0, 0) // valid for 1 year
+	// create tls credential configuration
+	tlsConfig := cert.TlsConfig{
+		CertCfg:      clientCertConfig,
+		CertProvider: cfg.GlobalConfig.TLSCertProvider,
+		CACertPath:   cert.GetCACertPath(cfg.GlobalConfig.TLSCertPath),
+		CertPath:     cert.GetClientCertPath(cfg.GlobalConfig.TLSCertPath),
 	}
-	pemServerCA, err := os.ReadFile(certPath)
-	if err != nil {
-		return nil, err
-	}
-
-	certPool := x509.NewCertPool()
-	if !certPool.AppendCertsFromPEM(pemServerCA) {
-		return nil, fmt.Errorf("failed to add server CA's certificate")
-	}
-
-	// Create the credentials and return it
-	config := &tls.Config{
-		RootCAs: certPool,
-	}
-
-	return credentials.NewTLS(config), nil
+	creds, err := cert.NewTlsCredentialManager(&tlsConfig).CreateTlsClientCredentials()
+	return creds, err
 }
 
 // NewClient Function
@@ -346,10 +334,7 @@ func NewClient(server string) *LogClient {
 			return nil
 		}
 	} else {
-		tlsCredentials := &tls.Config{
-			InsecureSkipVerify: true,
-		}
-		creds = credentials.NewTLS(tlsCredentials)
+		creds = insecure.NewCredentials()
 	}
 
 	lc.conn, err = grpc.Dial(lc.Server, grpc.WithTransportCredentials(creds))
@@ -670,7 +655,17 @@ func NewRelayServer(port string) *RelayServer {
 	}
 
 	// create a log server
-	rs.LogServer = grpc.NewServer(grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp))
+	var creds credentials.TransportCredentials
+	if cfg.GlobalConfig.TLSEnabled {
+		creds, err = loadTLSCredentials()
+		if err != nil {
+			kg.Errf("cannot load TLS credentials: ", err)
+			return nil
+		}
+		rs.LogServer = grpc.NewServer(grpc.Creds(creds), grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp))
+	} else {
+		rs.LogServer = grpc.NewServer(grpc.KeepaliveEnforcementPolicy(kaep), grpc.KeepaliveParams(kasp))
+	}
 
 	// register a log service
 	logService := &LogService{}
